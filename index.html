@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>webglBoids</title>
+	<style>
+	body {
+		margin: 0;
+		overflow: hidden;
+	}
+	</style>
+	<script id="shader-vs" type="x-shader/x-vertex">
+	attribute vec4 aVertexPositionAndColorW;
+
+	attribute vec2 aInstanceOffset;
+	attribute vec2 aInstanceForward;
+
+	uniform vec2 uVOffset;
+
+	varying float colorIntensity;
+
+	void main(void) {
+		mat4 mPMat = mat4(
+			1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			aInstanceOffset.x, -aInstanceOffset.y, 0, 1
+			);
+
+		mat4 mRMat = mat4(
+			aInstanceForward.x, aInstanceForward.y, 0, 0,
+			-aInstanceForward.y, aInstanceForward.x, 0, 0,
+			0, 0, 1, 0,
+			0, 0, 0, 1
+			);
+
+		mat4 vOMat = mat4(
+			1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			-uVOffset.x, uVOffset.y, -1, 1
+			);
+
+		gl_Position = vOMat * mPMat * mRMat * vec4(aVertexPositionAndColorW.xyz, 1.0);
+		colorIntensity = aVertexPositionAndColorW.w;
+	}
+	</script>
+	<script id="shader-fs" type="x-shader/x-fragment">
+	precision mediump float;
+
+	varying float colorIntensity;
+
+	uniform vec3 uBodyColor;
+	uniform vec3 uEyeColor;
+
+	void main(void) {
+		vec3 color = uEyeColor * (1.0 - colorIntensity) + uBodyColor * colorIntensity;
+
+		gl_FragColor = vec4(color.rgb, 1.0);
+	}	
+	</script>
+	<script type="text/javascript">
+		var PI = 3.1415;
+		var resized = false;
+		var width = window.innerWidth;
+		var height = window.innerHeight;
+
+		var glCanvas;
+		var glContext;
+
+		var glGeometryProgram;
+		var glid_aVertexPositionAndColorW_glGeometryProgram;
+
+		var glid_aInstanceOffset_glGeometryProgram;
+		var glid_aInstanceForward_glGeometryProgram;
+
+		var locationsInvalid = false;
+		var uniformLocations = [];
+
+		var boids = [];
+
+		var glid_triangleVertBuffer;
+
+		var vec3_cameraPosition = [0,0, -10];
+
+		var ext_drawInstanced;
+
+		window.onresize = function () { resized = true; }
+
+		function start () {
+			prepareContext();
+
+			setupGLContext();
+
+			var tringleVerts = [
+				1.0, 0.0, 0.0, 0.0,
+				Math.cos(PI * 2 / 3), Math.sin(PI * 2 / 3), 0.0, 1.0,
+				Math.cos(PI * 4 / 3), Math.sin(PI * 4 / 3), 0.0, 1.0
+			];
+			glid_triangleVertBuffer = readyBuffer(tringleVerts, glContext.STATIC_DRAW);
+			if (glid_triangleVertBuffer == null ) return;
+
+			boids.positions = [
+				0.0, 0.0
+			];
+			boids.glid_positions = readyBuffer(boids.positions, glContext.STATIC_DRAW);
+			if( boids.glid_positions == null ) return;
+
+			boids.velocities = [
+				0.0, 1.0
+			];
+			boids.glid_velocities = readyBuffer(boids.velocities, glContext.STATIC_DRAW);
+			if( boids.glid_velocities == null ) return;
+
+			window.requestAnimationFrame(drawScene);
+		}
+
+		function prepareContext () {
+			glCanvas = document.getElementById('gl-canvas');
+			if( !glCanvas ) {console.error("Failed to acquire canvas."); return;}
+
+			glCanvas.width = width;
+			glCanvas.height = height;
+
+			glContext = glCanvas.getContext('webgl');
+			if( !glContext ) {console.error("WebGL instantiation failed."); return;}
+		}
+
+		function setupGLContext () {
+			glContext.clearColor(0.0, 0.0, 0.0, 1.0);
+			glContext.enable(glContext.DEPTH_TEST);
+
+			ext_drawInstanced = glContext.getExtension("ANGLE_instanced_arrays");
+			if( !ext_drawInstanced ) {console.error('ANGLE instanced arrays is unsupported.'); return;}
+
+			glGeometryProgram = createShaderProgram ("shader-vs", "shader-fs");
+			if( !glGeometryProgram ) {console.error('Geometry Shader Program Instantiation Flailed.'); return;}
+
+			glid_aVertexPositionAndColorW_glGeometryProgram = 
+				glContext.getAttribLocation(glGeometryProgram, "aVertexPositionAndColorW");
+			if( glid_aVertexPositionAndColorW_glGeometryProgram == null ) {console.error('Failed to locate GLID for attribute: aVertexPositionAndColorW.'); return;}
+
+			glid_aInstanceOffset_glGeometryProgram = 
+				glContext.getAttribLocation(glGeometryProgram, "aInstanceOffset");
+			if( glid_aInstanceOffset_glGeometryProgram == null ) {console.error('Failed to locate GLID for attribute: aInstanceOffset.'); return;}
+
+			glid_aInstanceForward_glGeometryProgram =
+				glContext.getAttribLocation(glGeometryProgram, "aInstanceForward");
+			if( glid_aInstanceForward_glGeometryProgram == null ) {console.error('Failed to locate GLID for attribute: aInstanceForward.'); return;}
+		}
+
+		var previousFrameStartTime;
+
+		function drawScene (frameStartTime) {
+			var deltaTime = (frameStartTime - previousFrameStartTime) / 1000;
+			previousFrameStartTime = frameStartTime;
+
+			if( resized ) resize();
+
+			glContext.clear(glContext.COLOR_BUFFER_BIT | glContext.DEPTH_BUFFER_BIT);
+
+			glContext.useProgram(glGeometryProgram);
+
+			setUniformVec2(glGeometryProgram, "uVOffset", [0.0, 0.0]);
+
+			setUniformVec3(glGeometryProgram, "uEyeColor", [0.5, 0.5, 1.0]);
+			setUniformVec3(glGeometryProgram, "uBodyColor", [1.0, 1.0, 0.0]);
+
+			glContext.bindBuffer(glContext.ARRAY_BUFFER, glid_triangleVertBuffer);
+			glContext.vertexAttribPointer(
+				glid_aVertexPositionAndColorW_glGeometryProgram,
+				4,
+				glContext.FLOAT,
+				false,
+				16,
+				0
+			);
+			ext_drawInstanced.vertexAttribDivisorANGLE(glid_aVertexPositionAndColorW_glGeometryProgram, 0);
+
+			glContext.bindBuffer(glContext.ARRAY_BUFFER, boids.glid_positions);
+			glContext.vertexAttribPointer(
+				glid_aInstanceOffset_glGeometryProgram,
+				2,
+				glContext.FLOAT,
+				false,
+				8,
+				0
+			);
+			ext_drawInstanced.vertexAttribDivisorANGLE(glid_aInstanceOffset_glGeometryProgram, 1);
+
+			glContext.bindBuffer(glContext.ARRAY_BUFFER, boids.glid_velocities);
+			glContext.vertexAttribPointer(
+				glid_aInstanceForward_glGeometryProgram,
+				2,
+				glContext.FLOAT,
+				false,
+				8,
+				0
+			);
+			ext_drawInstanced.vertexAttribDivisorANGLE( glid_aInstanceForward_glGeometryProgram, 1);
+
+			ext_drawInstanced.drawArraysInstancedANGLE(
+				glContext.TRIANGLES,
+				0,
+				3,
+				1
+			);
+
+			window.requestAnimationFrame(drawScene);
+		}
+
+		function resize () {
+			width = window.innerWidth;
+			height = window.innerHeight;
+
+			glCanvas.width = width;
+			glCanvas.height = height;
+
+			glContext.viewport( 0, 0, width, height );
+
+			resized = false;
+		}
+
+		function setUniformVec2(shader, uniformName, vec) {
+			var glid_uniform = getUniformLocation(shader, uniformName);
+			glContext.uniform2fv(glid_uniform, new Float32Array(vec));
+		}
+
+		function setUniformVec3(shader, uniformName, vec) {
+			var glid_uniform = getUniformLocation(shader, uniformName);
+			glContext.uniform3fv(glid_uniform, new Float32Array(vec));
+		}
+
+		function getUniformLocation( shader, uniformName ) {
+			if (locationsInvalid) uniformLocations = [];
+			if (uniformLocations[uniformName] === undefined) {
+				uniformLocations[uniformName] = glContext.getUniformLocation(shader, uniformName);
+				if(uniformLocations[uniformName] == null) 
+					console.error("Unable to get location for uniform: " + uniformName);
+			}
+			return uniformLocations[uniformName];
+		}
+
+		// Uses importShaderSource to build a shader program using a vertex and fragment shader
+		// Gets uniform locations and stores the data in a shaderProgram structure for passing back
+		function createShaderProgram(vShader, fShader) {
+			var glid_vertexShader = importShaderSource(fShader);
+			var glid_fragmentShader = importShaderSource(vShader);
+			
+			if ( glid_fragmentShader == null || glid_vertexShader == null) { return null; }
+
+			var glid_shaderProgram = glContext.createProgram();
+			glContext.attachShader(glid_shaderProgram, glid_vertexShader);
+			glContext.attachShader(glid_shaderProgram, glid_fragmentShader);
+			glContext.linkProgram(glid_shaderProgram);
+
+			if (!glContext.getProgramParameter(glid_shaderProgram, glContext.LINK_STATUS)) {
+			    console.error("Unable to initialize the shader program. \nInfo Log:\n" + glContext.GetProgramInfoLog(glid_shaderProgram));
+			    return null;
+			}
+
+			return glid_shaderProgram;
+		}
+
+		// Gets a shader script from an element in the html document and compiles the shader,
+		// prints any error messages returned by the driver during compilation to the console
+		function importShaderSource(shaderName) {
+			var shaderScript, shaderSource, currentChild, glid_shader;
+
+			shaderScript = document.getElementById(shaderName);
+
+			if (!shaderScript) { return null; }
+
+			shaderSource = "";
+			currentChild = shaderScript.firstChild;
+
+			while(currentChild) {
+				if (currentChild.nodeType == currentChild.TEXT_NODE) {
+					shaderSource += currentChild.textContent;
+				}
+
+				currentChild = currentChild.nextSibling;
+			}
+
+			if (shaderScript.type == "x-shader/x-fragment") {
+				glid_shader = glContext.createShader(glContext.FRAGMENT_SHADER);
+			} else if (shaderScript.type == "x-shader/x-vertex") {
+				glid_shader = glContext.createShader(glContext.VERTEX_SHADER);
+			} else {
+				return null;
+			}
+			
+			glContext.shaderSource(glid_shader, shaderSource);
+			glContext.compileShader(glid_shader);
+
+			if (!glContext.getShaderParameter(glid_shader, glContext.COMPILE_STATUS)) {
+				console.error("An error occured compiling the shader: " + shaderName + ".\nInfo Log:\n" + glContext.getShaderInfoLog(glid_shader));
+				return null;
+			} else { }
+
+			return glid_shader;
+		}
+
+		function readyBuffer (bufferData, bufferType) {
+			var glid_bufferLocation = glContext.createBuffer();
+			if( glid_bufferLocation == null ) { console.error('Failed to allocate array buffer.'); return null; }
+			glContext.bindBuffer(glContext.ARRAY_BUFFER, glid_bufferLocation);
+			glContext.bufferData(glContext.ARRAY_BUFFER, new Float32Array(bufferData), bufferType);
+			return glid_bufferLocation;
+		}
+	</script>
+</head>
+<body onload="start()">
+	<canvas id="gl-canvas"></canvas>
+</body>
+</html>
