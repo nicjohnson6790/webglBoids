@@ -2,6 +2,8 @@
 <head>
 	<script>
 		window.onresize = function () { resized = true; }
+		document.onvisibilitychange = function () { visibilityUpdated = true; }
+		window.onclick = function (event) { handleMouseClick(event); } 
 
 		//canvas size
 		var width = window.innerWidth;
@@ -23,6 +25,8 @@
 
 		var previousFrameTime = 0.0;
 		var keyStates = [];
+
+		var visibilityUpdated = false;
 		//end program variables
 
 		//camera vars
@@ -48,14 +52,31 @@
 		Math.cos(Math.PI * 4/3), Math.sin(Math.PI * 4/3), 0.0		
 		];
 
-		var num_instances = 100000;
-		var boidInfo = new Float32Array(num_instances * 4);
+		var numBoids = 10;
+		var maxBoids = 100000;
+		var boidInfo = new Float32Array(4*maxBoids);
 		var boidSpeeds = [];
 
-		var start = [-15.0, -25.0];
-		var end = [35.0, 25.0];
+		var numGuidelines = 2;
+		var maxGuidelines = 100;
+		var guidelineInfo = new Float32Array(4*maxGuidelines);
+		
+		guidelineInfo[0] = -20.0;
+		guidelineInfo[1] = -25.0;
+		guidelineInfo[2] = 45.0;
+		guidelineInfo[3] = -5.0;
+
+		guidelineInfo[4] = 25.0;
+		guidelineInfo[5] = 150.0;
+		guidelineInfo[6] = -50.0;
+		guidelineInfo[7] = 170.0;
 		var glr = 1.25;
-		var force = 1.0;
+		var ext_force = 9.0;
+		var int_force = 0.3;
+		var drag_factor = 0.04;
+		var boids_per_click = 100;
+		var min_speed_thresh = 30.0;
+		var min_dist_thresh = 0;
 		//end data
 
 		//program shaders
@@ -65,7 +86,7 @@
 		in vec4 a_inst_offsetXY_forwardZW;
 
 		const vec4 eyeColor = vec4(1.0, 1.0, 1.0, 1.0);
-		const vec4 bodyColor = vec4(1.0, 0.0, 0.0, 1.0);
+		const vec4 bodyColor = vec4(0.3, 0.3, 1.0, 1.0);
 
 		uniform mat4 u_projectionMatrix;
 		uniform mat4 u_cameraPositionMatrix;
@@ -101,7 +122,9 @@
 		//end program shaders
 
 		function init () {
-			canvas = document.getElementById('gameCanvas');
+			initDebugMenu();
+
+			canvas = document.getElementById('gameCanvas'); 
 			if(!canvas) console.error('ERROR: Failed to get the canvas element.');
 			canvas.width = width;
 			canvas.height = height;
@@ -117,19 +140,29 @@
 
 			resize();
 
-			for (var i = 0; i < num_instances; i++) {
+			for (var i = 0; i < numBoids; i++) {
 				var forwardAngle = Math.random() * Math.PI * 2.0;
 				boidInfo[i*4] = Math.random() * 50 - 25;
 				boidInfo[i*4 + 1] = Math.random() * 50 - 25;
 				boidInfo[i*4 + 2] = Math.cos(forwardAngle);
 				boidInfo[i*4 + 3] = Math.sin(forwardAngle);
-				boidSpeeds[i] = Math.random() * 10;
+				boidSpeeds[i] = Math.random() * 8 + 2;
 			}
 
 			initBuffers();
 			initVao();
 
 			draw();
+		}
+
+		function initDebugMenu() {
+			document.getElementById('glr_value').innerHTML = glr;
+			document.getElementById('extForce_value').innerHTML = ext_force;
+			document.getElementById('intForce_value').innerHTML = int_force;
+			document.getElementById('dragFactor_value').innerHTML = drag_factor;
+			document.getElementById('minSpeedThresh_value').innerHTML = min_speed_thresh;
+			document.getElementById('minDistThresh_value').innerHTML = min_dist_thresh;
+			document.getElementById('bpc_value').innerHTML = boids_per_click;
 		}
 
 		function initBuffers() {
@@ -181,9 +214,16 @@
 		}
 
 		function draw (currentTime) {
+			if(visibilityUpdated) {
+				previousFrameTime = currentTime;
+				visibilityUpdated = false;
+				window.requestAnimationFrame(draw);
+			}
 			var deltaTime = (currentTime - previousFrameTime) / 1000;
+			previousFrameTime = currentTime;
 			handleInput(deltaTime);
 			handleZoom(deltaTime);
+			readDebugMenu();
 			if(resized) { resize(); }
 
 			updateBoids(deltaTime);
@@ -196,113 +236,108 @@
 				uniformLocations['u_cameraPositionMatrix'], 
 				false,
 				new Float32Array([
-					1.0, 0.0, 0.0, 0.0,
-					0.0, 1.0, 0.0, 0.0,
-					0.0, 0.0, 1.0, 0.0,
-					cameraX, cameraY, cameraZoom, 1.0
+					1.0/cameraZoom, 0.0, 0.0, 0.0,
+					0.0, 1.0/cameraZoom, 0.0, 0.0,
+					0.0, 0.0, 1.0/cameraZoom, 0.0,
+					cameraX/cameraZoom, cameraY/cameraZoom, -1.0, 1.0
 					])
 				);
 
 			//context.drawArrays(context.TRIANGLES, 0, 3);
-			context.drawArraysInstanced(context.TRIANGLES, 0, 3, boidInfo.length/4);
+			context.drawArraysInstanced(context.TRIANGLES, 0, 3, numBoids);
 
-			previousFrameTime = currentTime;
+			
 			window.requestAnimationFrame(draw);
 		}
 
 		function updateBoids(deltaTime) {
+			//K.I.S.S.
 			if(isNaN(deltaTime)) return;
 
 			var er = glr;
 
-			for(var i = 0; i < boidInfo.length/4; i++) {
-				//translate from speed and direction to velocity
-				var velX = boidInfo[4*i + 2] * boidSpeeds[i];
-				var velY = boidInfo[4*i + 3] * boidSpeeds[i];
+			for(var i = 0; i < numBoids; i++) {
+				var boid_a_vx = 0;
+				var boid_a_vy = 0;
+				for(var j = 0; j < numGuidelines; j++) {
+					var boid_x = boidInfo[i*4];
+					var boid_y = boidInfo[i*4+1];
 
-				//update positions for velocity
-				boidInfo[4*i] += velX * deltaTime;
-				boidInfo[4*i + 1] += velY * deltaTime;
+					var boid_vx = boidInfo[i*4+2] * boidSpeeds[i];
+					var boid_vy = boidInfo[i*4+3] * boidSpeeds[i];
 
-				var boid_p = [boidInfo[4*i], boidInfo[4*i + 1]];
-				var b2s_i = p2pDistance(boid_p[0], boid_p[1], start[0], start[1]);
-				var b2e_i = p2pDistance(boid_p[0], boid_p[1], end[0], end[1]);
-				var c_p = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0];
-				var b2c_i = p2pDistance(boid_p[0], boid_p[1], c_p[0], c_p[0])
-				var gll_i = p2pDistance(start[0], start[1], end[0], end[1]);
-				var accel_v = [0.0, 0.0];
-				var b2c_v = [(c_p[0] - boid_p[0]) / b2c_i, (c_p[1] - boid_p[1]) / b2c_i];		
+					var gl_start_x = guidelineInfo[j*4];
+					var gl_start_y = guidelineInfo[j*4+1];
+					var gl_end_x = guidelineInfo[j*4+2];
+					var gl_end_y = guidelineInfo[j*4+3];
+					var gl_mid_x = (gl_start_x + gl_end_x)/2;
+					var gl_mid_y = (gl_start_y + gl_end_y)/2;
 
-				if(b2s_i + b2e_i < gll_i * er) {
-					//guide and arrest motion lateral to the guideline
-					var glv_v = [(end[0] - start[0]) / gll_i, (end[1] - start[1]) / gll_i];
-					var arrestingForce = 
-						arrestLateralMotionForce(glv_v[0], glv_v[1], boidInfo[4*i + 2], boidInfo[4*i + 3]);
-					accel_v[0] += (glv_v[0] + arrestingForce[0]) * (force);
-					accel_v[1] += (glv_v[1] + arrestingForce[1]) * (force);
-				}
-				if(b2s_i + b2e_i > gll_i * er && b2c_i < 2.0 * gll_i) {
-					//pull towards start
-					var b2s_v = [(start[0] - boid_p[0]) / b2s_i, (start[1] - boid_p[1]) / b2s_i];
-					accel_v[0] += b2s_v[0] * force * 2;
-					accel_v[1] += b2s_v[1] * force * 2;
+					var gl_dx = gl_end_x - gl_start_x;
+					var gl_dy = gl_end_y - gl_start_y;
+					var gl_length = Math.sqrt(gl_dx * gl_dx + gl_dy * gl_dy);
+					var gl_oval_length = gl_length * er;
+
+					var b2gls_x = gl_start_x - boid_x;
+					var b2gls_y = gl_start_y - boid_y;
+					var b2gle_x = gl_end_x - boid_x;
+					var b2gle_y = gl_end_y - boid_y;
+					var b2glm_x = gl_mid_x - boid_x;
+					var b2glm_y = gl_mid_y - boid_y;
+					var boid_ov_dist = 
+						Math.sqrt(b2gls_x * b2gls_x + b2gls_y * b2gls_y) +
+						Math.sqrt(b2gle_x * b2gle_x + b2gle_y * b2gle_y);
+					var boid_gl_dist =
+						Math.sqrt(b2glm_x * b2glm_x + b2glm_y * b2glm_y);
 					
-					//if closer to end push away from center
-					if(b2e_i < b2s_i) {
-						accel_v[0] -= b2c_v[0] * force * 2;
-						accel_v[1] -= b2c_v[1] * force * 2;
-					} 
-					//if closer to end add drag
-					else {
+					var a = false;
 
+					if(boid_ov_dist <= gl_oval_length && 
+						boidSpeeds[i] > min_speed_thresh) { 
+						a = true;
+					} else { 
+						if(boid_gl_dist < min_dist_thresh){
+							a = true;
+						}
+					}
+
+					if(a) {
+						// boid inside oval influence
+						boid_a_vx += int_force * gl_dx;
+						boid_a_vy += int_force * gl_dy;
+					} else {
+						// boid outside oval influence
+						boid_a_vx += gl_length * ext_force * b2glm_x / (boid_gl_dist * boid_gl_dist);
+						boid_a_vy += gl_length * ext_force * b2glm_y / (boid_gl_dist * boid_gl_dist);
 					}
 				}
-				if(b2c_i > 2.0 * gll_i) {
-					//pull towards nearest guideline
-					accel_v[0] += b2c_v[0] * force;
-					accel_v[1] += b2c_v[1] * force;
-				}
+				// update positions
+				boidInfo[i*4] += boid_vx * deltaTime + .5 * boid_a_vx * deltaTime;
+				boidInfo[i*4+1] += boid_vy * deltaTime + .5 * boid_a_vx * deltaTime;
 
-				//update velocity components and positions for acceleration
-				velX += accel_v[0] * deltaTime;
-				velY += accel_v[1] * deltaTime;
+				// update velocities
+				boid_vx += boid_a_vx * deltaTime;
+				boid_vy += boid_a_vy * deltaTime;
+				var boid_s = Math.sqrt(boid_vx * boid_vx + boid_vy * boid_vy);
 
-				boidInfo[4*i] += accel_v[0] * deltaTime / 2.0;
-				boidInfo[4*i + 1] += accel_v[1] * deltaTime / 2.0;
-
-				//split velocity to speed and direction again
-				boidSpeeds[i] = Math.sqrt(velX * velX + velY * velY);
-				boidInfo[4*i + 2] = velX / boidSpeeds[i];
-				boidInfo[4*i + 3] = velY / boidSpeeds[i];
-
-				//if(i == 0) console.log('(' + boidInfo[4*i] + ', ' + boidInfo[4*i + 1] + ')');
+				// split and update speed data
+				boidInfo[i*4+2] = boid_vx / boid_s;
+				boidInfo[i*4+3] = boid_vy / boid_s;
+				boidSpeeds[i] = boid_s - boid_s * (drag_factor) * deltaTime;
 			}
 			context.bindBuffer(context.ARRAY_BUFFER, glid_boid_offsetBuffer);
 			context.bufferSubData(context.ARRAY_BUFFER, 0, boidInfo);
 		}
 
-		function arrestLateralMotionForce(v_tx, v_ty, v_vx, v_vy, aav) {
-			// calculate antilateral direction
-			var dot = dot2f(v_vx, v_vy, v_tx, v_ty);
-			var reflectionX = v_tx * dot - v_vx;
-			var reflectionY = v_ty * dot - v_vy;
-
-			// arrest antitarget vector
-			if(dot < 0 && aav) {
-				reflectionX += v_tx * (-dot);
-				reflectionY += v_ty * (-dot);
-			}
-
-			return [reflectionX, reflectionY];
-		}
-
-		function p2pDistance (p1x, p1y, p2x, p2y) {
-			return Math.sqrt(((p1x-p2x)*(p1x-p2x))+
-					((p1y-p2y)*(p1y-p2y)));
-		}
-
-		function dot2f (p1x, p1y, p2x, p2y) {
-			return (p1x * p2x + p1y * p2y);
+		function readDebugMenu() {
+			glr = Number.parseFloat(document.getElementById('glr_value').value);
+			ext_force = Number.parseFloat(document.getElementById('extForce_value').value);
+			int_force = Number.parseFloat(document.getElementById('intForce_value').value);
+			drag_factor = Number.parseFloat(document.getElementById('dragFactor_value').value);
+			min_speed_thresh = Number.parseFloat(document.getElementById('minSpeedThresh_value').value);
+			min_dist_thresh = Number.parseFloat(document.getElementById('minDistThresh_value').value);
+			boids_per_click = Number.parseFloat(document.getElementById('bpc_value').value);
+			//console.log(glr + ", " + ext_force + ", " + int_force + ", " + drag_factor + ", " + min_speed_thresh + ", " + min_dist_thresh + ", " + boids_per_click);
 		}
 
 		function initGeometryProgram() {
@@ -361,16 +396,23 @@
 			canvas.height = height - 0;
 
 			if(context) context.viewport(0,0,width,height);
+			var ar = width/height;
 
 			if(geometryProgram) context.uniformMatrix4fv(
 				uniformLocations['u_projectionMatrix'], 
 				false,
+				// new Float32Array([
+				// 	1.0/(width/height * tanHalfFOV), 0.0, 0.0, 0.0,
+				// 	0.0, 1.0/tanHalfFOV, 0.0, 0.0,
+				// 	0.0, 0.0, projA, 1.0,
+				// 	0.0, 0.0, projB, 0.0
+				// 	]) // perspective matrix
 				new Float32Array([
-					1.0/(width/height * tanHalfFOV), 0.0, 0.0, 0.0,
-					0.0, 1.0/tanHalfFOV, 0.0, 0.0,
-					0.0, 0.0, projA, 1.0,
-					0.0, 0.0, projB, 0.0
-					])
+					1.0, 0.0, 0.0, 0.0,
+					0.0, ar, 0.0, 0.0,
+					0.0, 0.0, 1.0, 0.0,
+					0.0, 0.0, 0.0, 1.0
+					]) // orthogonal matrix
 				);
 		}
 
@@ -405,11 +447,11 @@
 			//console.log(cameraZoom);			
 		}
 
-/* KEYCODES
-			W = 87		E = 69	|	U = 85		I = 73		O = 79	|	[ = 219		] = 221		
-A = 65		S = 83		D = 68	|	J = 74		K = 75		L = 76	|
-						C = 67	|	M = 77
-*/
+		/* KEYCODES
+					W = 87		E = 69	|	U = 85		I = 73		O = 79	|	[ = 219		] = 221		
+		A = 65		S = 83		D = 68	|	J = 74		K = 75		L = 76	|
+								C = 67	|	M = 77
+		*/
 		function handleInput(deltaTime) {
 			if(keyStates[87]) cameraY -= deltaTime * cameraZoom;
 			if(keyStates[83]) cameraY += deltaTime * cameraZoom;
@@ -417,14 +459,59 @@ A = 65		S = 83		D = 68	|	J = 74		K = 75		L = 76	|
 			if(keyStates[65]) cameraX += deltaTime * cameraZoom;
 			if(keyStates[68]) cameraX -= deltaTime * cameraZoom;
 		}
+
+		function handleMouseClick (event) {
+			var ar = width/height;
+			var x = -cameraX + (event.clientX/width - 0.5) * (cameraZoom*2);
+			var y = -cameraY - (event.clientY/height - 0.5) * (cameraZoom*2)/(width/height);
+			console.log('(' + x + ', ' + y + ')');
+			for(var i = 0; i < boids_per_click; i++) {
+				boidInfo[4*numBoids] = x;
+				boidInfo[4*numBoids + 1] = y;
+				
+				var forwardAngle = Math.random() * Math.PI * 2.0 + Math.PI * i / boids_per_click;
+				boidInfo[4* numBoids + 2] = Math.cos(forwardAngle);
+				boidInfo[4*numBoids + 3] = Math.sin(forwardAngle);
+				boidSpeeds[numBoids] = Math.random() * 8 + 2;
+				numBoids++;
+			}
+			
+			document.title = numBoids + " boids";
+		}
 	</script>
 	<style>
 		body {
 			margin: 0;
 		}
+		#debugMenu
+		{
+			color: white;
+			position: absolute;
+			top: 10px;
+			left: 10px;
+			width: 145px;
+			display: flex;
+			flex-direction: column;
+		}
 	</style>
 </head>
-<body onload="init()" onkeydown="handlekeydown(event)" onkeyup="handlekeyup(event)" onmousewheel="handlescroll(event)">
-	<canvas id="gameCanvas"></canvas>
+<body onload="init()" onkeydown="handlekeydown(event)" onkeyup="handlekeyup(event)">
+	<canvas id="gameCanvas" onmousewheel="handlescroll(event)"></canvas>
+	<div id="debugMenu">
+		<div id="glr_header">Guideline Ratio</div>
+		<textarea id="glr_value" rows="1" cols="10"></textarea>
+		<div id="extForce_header">External Force</div>
+		<textarea id="extForce_value" rows="1" cols="10"></textarea>
+		<div id="intForce_header">Internal Force</div>
+		<textarea id="intForce_value" rows="1" cols="10"></textarea>
+		<div id="dragFactor_header">Drag Factor</div>
+		<textarea id="dragFactor_value" rows="1" cols="10"></textarea>
+		<div id="minSpeedThresh_header">Min Speed Threshold</div>
+		<textarea id="minSpeedThresh_value" rows="1" cols="10"></textarea>
+		<div id="minDistThresh_header">Min Distance Threshold</div>
+		<textarea id="minDistThresh_value" rows="1" cols="10"></textarea>
+		<div id="bpc_header">Boids Per Click</div>
+		<textarea id="bpc_value" rows="1" cols="10"></textarea>
+	</div>
 </body>
 </html>
